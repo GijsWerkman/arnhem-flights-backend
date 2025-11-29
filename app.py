@@ -15,6 +15,9 @@ ADSB_URL = "https://opendata.adsb.fi/api/v3/lat/51.9851/lon/5.8987/dist/3"
 
 app = Flask(__name__)
 
+collector_started = False   # <-- important global flag
+
+
 # ---------------------------------
 # Database init
 # ---------------------------------
@@ -27,8 +30,9 @@ def init_db():
     cur.close()
     conn.close()
 
+
 # ---------------------------------
-# Generic query helper
+# Query helper
 # ---------------------------------
 def query(sql):
     conn = get_conn()
@@ -38,6 +42,7 @@ def query(sql):
     cur.close()
     conn.close()
     return rows
+
 
 # ---------------------------------
 # Collector logic
@@ -52,7 +57,8 @@ def haversine_km(lat1, lon1, lat2, lon2):
         math.sin(dphi/2)**2 +
         math.cos(phi1) * math.cos(phi2) * math.sin(dlambda/2)**2
     )
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
 
 def save_positions(ac_list):
     conn = get_conn()
@@ -65,7 +71,6 @@ def save_positions(ac_list):
         if lat is None or lon is None:
             continue
 
-        # filter: 5 km around Arnhem
         if haversine_km(ARNHEM_LAT, ARNHEM_LON, lat, lon) > BUBBLE_RADIUS_KM:
             continue
 
@@ -76,76 +81,3 @@ def save_positions(ac_list):
             ac.get("icao"),
             (ac.get("flight") or "").strip(),
             now,
-            lat,
-            lon,
-            ac.get("alt_baro"),
-            ac.get("gs"),
-        ))
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
-def collector_loop():
-    print("Collector thread started")
-    init_db()
-
-    while True:
-        try:
-            r = requests.get(ADSB_URL, timeout=10)
-            r.raise_for_status()
-            ac = r.json().get("ac", [])
-            save_positions(ac)
-            print("Saved batch at", datetime.utcnow())
-        except Exception as e:
-            print("Collector error:", e)
-
-        time.sleep(10)
-
-# Start collector once the server is ready
-@app.before_serving
-def start_collector():
-    t = threading.Thread(target=collector_loop, daemon=True)
-    t.start()
-    print("Collector thread launched")
-
-# ---------------------------------
-# API endpoints
-# ---------------------------------
-@app.get("/api/last10")
-def last10():
-    rows = query("""
-        SELECT ts, callsign, gs_kts, alt_ft
-        FROM positions
-        ORDER BY ts DESC
-        LIMIT 10;
-    """)
-
-    return jsonify([
-        {
-            "ts": datetime.fromtimestamp(r["ts"], tz=timezone.utc).isoformat(),
-            "callsign": r["callsign"],
-            "gs_kts": r["gs_kts"],
-            "alt_ft": r["alt_ft"],
-        }
-        for r in rows
-    ])
-
-@app.get("/api/daily_counts")
-def daily_counts():
-    rows = query("""
-        SELECT to_char(to_timestamp(ts), 'YYYY-MM-DD') AS day,
-               COUNT(*) AS flights
-        FROM positions
-        GROUP BY 1
-        ORDER BY 1;
-    """)
-    return jsonify(rows)
-
-@app.get("/")
-def home():
-    return "Arnhem Flight API running (collector active)"
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
