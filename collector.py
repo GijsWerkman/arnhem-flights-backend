@@ -8,7 +8,7 @@ ARNHEM_LAT = 51.9851
 ARNHEM_LON = 5.8987
 BUBBLE_RADIUS_KM = 5.0
 ADSB_URL = "https://opendata.adsb.fi/api/v3/lat/51.9851/lon/5.8987/dist/3"
-DB_PATH = "flights.db"
+DB_PATH = "/data/flights.db"
 
 def haversine_km(lat1, lon1, lat2, lon2):
     R = 6371.0
