@@ -1,3 +1,4 @@
+from flask_cors import CORS
 from flask import Flask, jsonify
 from datetime import datetime, timezone
 import threading
@@ -14,6 +15,7 @@ BUBBLE_RADIUS_KM = 5.0
 ADSB_URL = "https://opendata.adsb.fi/api/v3/lat/51.9851/lon/5.8987/dist/3"
 
 app = Flask(__name__)
+CORS(app)
 
 collector_started = False  # start collector once
 
