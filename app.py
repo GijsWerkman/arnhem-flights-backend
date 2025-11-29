@@ -101,10 +101,11 @@ def collector_loop():
 
         time.sleep(10)
 
-@app.before_first_request
+@app.before_serving
 def start_collector():
     t = threading.Thread(target=collector_loop, daemon=True)
     t.start()
+    print("Collector thread launched.")
 
 # -----------------------------
 # API endpoints
