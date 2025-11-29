@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: arnhem-flights-api
+    env: python
+    plan: free
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    disk:
+      name: flightdb
+      mountPath: /data
+      sizeGB: 1
+
+  - type: worker
+    name: arnhem-flights-collector
+    env: python
+    plan: free
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python collector.py
+    disk:
+      name: flightdb
+      mountPath: /data
+      sizeGB: 1
