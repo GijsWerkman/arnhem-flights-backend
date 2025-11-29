@@ -1,9 +1,16 @@
 from flask import Flask, jsonify
 from datetime import datetime, timezone
 import sqlite3
+import os
 
 DB = "flights.db"
 app = Flask(__name__)
+
+if not os.path.exists("/data/flights.db"):
+    conn = sqlite3.connect("/data/flights.db")
+    with open("schema.sql") as f:
+        conn.executescript(f.read())
+    conn.close()
 
 def query(sql):
     conn = sqlite3.connect(DB)
