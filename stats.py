@@ -1,7 +1,7 @@
 import sqlite3
 from datetime import datetime, timezone
 
-DB = "flights.db"
+DB_PATH = "/data/flights.db"
 
 def last10():
     conn = sqlite3.connect(DB)
