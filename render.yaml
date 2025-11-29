@@ -6,10 +6,11 @@ services:
     branch: main
     buildCommand: pip install -r requirements.txt
     startCommand: python app.py
-    disk:
-      name: flightdb
-      mountPath: /data
-      sizeGB: 1
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: arnhem-flights-db
+          property: connectionString
 
   - type: worker
     name: arnhem-flights-collector
@@ -18,7 +19,12 @@ services:
     branch: main
     buildCommand: pip install -r requirements.txt
     startCommand: python collector.py
-    disk:
-      name: flightdb
-      mountPath: /data
-      sizeGB: 1
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: arnhem-flights-db
+          property: connectionString
+
+databases:
+  - name: arnhem-flights-db
+    plan: free
