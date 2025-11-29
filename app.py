@@ -8,9 +8,7 @@ import requests
 
 from db import get_conn
 
-# -------------------------------
-# Arnhem bubble settings
-# -------------------------------
+# Arnhem bubble config
 ARNHEM_LAT = 51.9851
 ARNHEM_LON = 5.8987
 BUBBLE_RADIUS_KM = 5.0
@@ -19,12 +17,12 @@ ADSB_URL = "https://opendata.adsb.fi/api/v3/lat/51.9851/lon/5.8987/dist/3"
 app = Flask(__name__)
 CORS(app)
 
-collector_started = False
+collector_started = False  # ensures background thread runs only once
 
 
-# -------------------------------
+# -------------------------------------------------------------------
 # Database initialization
-# -------------------------------
+# -------------------------------------------------------------------
 def init_db():
     conn = get_conn()
     cur = conn.cursor()
@@ -35,9 +33,9 @@ def init_db():
     conn.close()
 
 
-# -------------------------------
+# -------------------------------------------------------------------
 # Query helper
-# -------------------------------
+# -------------------------------------------------------------------
 def query(sql):
     conn = get_conn()
     cur = conn.cursor()
@@ -48,9 +46,9 @@ def query(sql):
     return rows
 
 
-# -------------------------------
+# -------------------------------------------------------------------
 # Collector logic
-# -------------------------------
+# -------------------------------------------------------------------
 def haversine_km(lat1, lon1, lat2, lon2):
     R = 6371.0
     phi1 = math.radians(lat1)
@@ -76,22 +74,25 @@ def save_positions(ac_list):
         if lat is None or lon is None:
             continue
 
-        # Only store flights inside the radius
+        # restrict to 5 km bubble
         if haversine_km(ARNHEM_LAT, ARNHEM_LON, lat, lon) > BUBBLE_RADIUS_KM:
             continue
 
-        cur.execute("""
+        cur.execute(
+            """
             INSERT INTO positions (icao, callsign, ts, lat, lon, alt_ft, gs_kts)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """, (
-            ac.get("icao"),
-            (ac.get("flight") or "").strip(),
-            now,
-            lat,
-            lon,
-            ac.get("alt_baro"),
-            ac.get("gs"),
-        ))
+            """,
+            (
+                ac.get("icao"),
+                (ac.get("flight") or "").strip(),
+                now,
+                lat,
+                lon,
+                ac.get("alt_baro"),
+                ac.get("gs"),
+            )
+        )
 
     conn.commit()
     cur.close()
@@ -106,8 +107,8 @@ def collector_loop():
         try:
             r = requests.get(ADSB_URL, timeout=10)
             r.raise_for_status()
-            data = r.json().get("ac", [])
-            save_positions(data)
+            ac = r.json().get("ac", [])
+            save_positions(ac)
             print("Saved batch at", datetime.utcnow())
         except Exception as e:
             print("Collector error:", e)
@@ -115,9 +116,9 @@ def collector_loop():
         time.sleep(10)
 
 
-# -------------------------------
-# Start collector on first request
-# -------------------------------
+# -------------------------------------------------------------------
+# Start collector once on first request
+# -------------------------------------------------------------------
 @app.before_request
 def start_collector_once():
     global collector_started
@@ -128,15 +129,23 @@ def start_collector_once():
         collector_started = True
 
 
-# -------------------------------
-# API ENDPOINTS
-# -------------------------------
+# -------------------------------------------------------------------
+# API Endpoints
+# -------------------------------------------------------------------
 
+# UNIQUE-LAST 10 (option B)
 @app.get("/api/last10")
 def last10():
     rows = query("""
-        SELECT ts, callsign, gs_kts, alt_ft
-        FROM positions
+        WITH unique_latest AS (
+            SELECT DISTINCT ON (callsign)
+                callsign, ts, gs_kts, alt_ft
+            FROM positions
+            WHERE callsign IS NOT NULL AND callsign <> ''
+            ORDER BY callsign, ts DESC
+        )
+        SELECT *
+        FROM unique_latest
         ORDER BY ts DESC
         LIMIT 10;
     """)
@@ -146,7 +155,7 @@ def last10():
             "ts": datetime.fromtimestamp(r["ts"], tz=timezone.utc).isoformat(),
             "callsign": r["callsign"],
             "gs_kts": r["gs_kts"],
-            "alt_ft": r["alt_ft"],
+            "alt_ft": r["alt_ft"]
         }
         for r in rows
     ])
@@ -169,16 +178,18 @@ def stats():
     conn = get_conn()
     cur = conn.cursor()
 
+    # global stats
     cur.execute("""
         SELECT COUNT(*) AS total, MIN(ts) AS first_ts, MAX(ts) AS last_ts
         FROM positions;
     """)
-    row = cur.fetchone()
+    s = cur.fetchone()
 
-    total = row["total"]
-    first_ts = row["first_ts"]
-    last_ts = row["last_ts"]
+    total = s["total"]
+    first_ts = s["first_ts"]
+    last_ts = s["last_ts"]
 
+    # per-day stats
     cur.execute("""
         SELECT to_char(to_timestamp(ts), 'YYYY-MM-DD') AS day,
                COUNT(*) AS flights
@@ -186,36 +197,40 @@ def stats():
         GROUP BY 1
         ORDER BY 1;
     """)
-    daily = cur.fetchall()
+    days_raw = cur.fetchall()
+
+    # compute median & max
+    days = len(days_raw)
+    if days > 0:
+        counts = sorted([d["flights"] for d in days_raw])
+        mid = days // 2
+        if days % 2 == 1:
+            median = counts[mid]
+        else:
+            median = (counts[mid - 1] + counts[mid]) / 2
+        max_flights = max(counts)
+        max_day = days_raw[counts.index(max_flights)]["day"]
+    else:
+        median = 0
+        max_flights = 0
+        max_day = None
 
     cur.close()
     conn.close()
 
-    counts = [d["flights"] for d in daily]
-    days = len(counts)
-
-    median = 0
-    max_per_day = 0
-    max_date = None
-
-    if days > 0:
-        sorted_c = sorted(counts)
-        mid = days // 2
-        median = sorted_c[mid] if days % 2 == 1 else (sorted_c[mid - 1] + sorted_c[mid]) / 2
-        max_per_day = max(counts)
-        max_date = daily[counts.index(max_per_day)]["day"]
-
-    def ts_to_iso(ts):
-        return None if ts is None else datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+    def iso(ts):
+        if ts is None:
+            return None
+        return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
     return jsonify({
         "total_flights": total,
-        "first_ts": ts_to_iso(first_ts),
-        "last_ts": ts_to_iso(last_ts),
+        "first_ts": iso(first_ts),
+        "last_ts": iso(last_ts),
         "days": days,
         "median_per_day": median,
-        "max_per_day": max_per_day,
-        "max_per_day_date": max_date
+        "max_per_day": max_flights,
+        "max_per_day_date": max_day
     })
 
 
@@ -248,18 +263,17 @@ def top_callsigns():
 
 @app.get("/api/tracks")
 def tracks():
-    limit = 10
     conn = get_conn()
     cur = conn.cursor()
 
-    cur.execute(f"""
+    cur.execute("""
         WITH latest AS (
           SELECT callsign, MAX(ts) AS last_ts
           FROM positions
           WHERE callsign IS NOT NULL AND callsign <> ''
           GROUP BY callsign
           ORDER BY last_ts DESC
-          LIMIT {limit}
+          LIMIT 10
         )
         SELECT p.callsign, p.ts, p.lat, p.lon, p.alt_ft
         FROM positions p
@@ -271,10 +285,12 @@ def tracks():
     cur.close()
     conn.close()
 
-    grouped = {}
+    tracks = {}
     for r in rows:
         cs = r["callsign"]
-        grouped.setdefault(cs, []).append({
+        if cs not in tracks:
+            tracks[cs] = []
+        tracks[cs].append({
             "ts": datetime.fromtimestamp(r["ts"], tz=timezone.utc).isoformat(),
             "lat": r["lat"],
             "lon": r["lon"],
@@ -283,17 +299,17 @@ def tracks():
 
     return jsonify([
         {"callsign": cs, "points": pts}
-        for cs, pts in grouped.items()
+        for cs, pts in tracks.items()
     ])
 
 
 @app.get("/")
 def home():
-    return "Arnhem Flight API running ✓"
+    return "Arnhem Flight API running"
 
 
-# -------------------------------
-# Local debugging only
-# -------------------------------
+# -------------------------------------------------------------------
+# Run only when local (Render uses gunicorn)
+# -------------------------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
