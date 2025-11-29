@@ -7,7 +7,7 @@ import requests
 
 from db import get_conn
 
-# Arnhem bubble settings
+# Arnhem bubble
 ARNHEM_LAT = 51.9851
 ARNHEM_LON = 5.8987
 BUBBLE_RADIUS_KM = 5.0
@@ -15,9 +15,9 @@ ADSB_URL = "https://opendata.adsb.fi/api/v3/lat/51.9851/lon/5.8987/dist/3"
 
 app = Flask(__name__)
 
-# -----------------------------
-# DB Init
-# -----------------------------
+# ---------------------------------
+# Database init
+# ---------------------------------
 def init_db():
     conn = get_conn()
     cur = conn.cursor()
@@ -27,9 +27,9 @@ def init_db():
     cur.close()
     conn.close()
 
-# -----------------------------
-# Query helper
-# -----------------------------
+# ---------------------------------
+# Generic query helper
+# ---------------------------------
 def query(sql):
     conn = get_conn()
     cur = conn.cursor()
@@ -39,9 +39,9 @@ def query(sql):
     conn.close()
     return rows
 
-# -----------------------------
+# ---------------------------------
 # Collector logic
-# -----------------------------
+# ---------------------------------
 def haversine_km(lat1, lon1, lat2, lon2):
     R = 6371.0
     phi1 = math.radians(lat1)
@@ -65,6 +65,7 @@ def save_positions(ac_list):
         if lat is None or lon is None:
             continue
 
+        # filter: 5 km around Arnhem
         if haversine_km(ARNHEM_LAT, ARNHEM_LON, lat, lon) > BUBBLE_RADIUS_KM:
             continue
 
@@ -85,6 +86,7 @@ def save_positions(ac_list):
     cur.close()
     conn.close()
 
+
 def collector_loop():
     print("Collector thread started")
     init_db()
@@ -101,15 +103,16 @@ def collector_loop():
 
         time.sleep(10)
 
+# Start collector once the server is ready
 @app.before_serving
 def start_collector():
     t = threading.Thread(target=collector_loop, daemon=True)
     t.start()
-    print("Collector thread launched.")
+    print("Collector thread launched")
 
-# -----------------------------
+# ---------------------------------
 # API endpoints
-# -----------------------------
+# ---------------------------------
 @app.get("/api/last10")
 def last10():
     rows = query("""
