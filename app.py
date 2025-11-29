@@ -1,22 +1,15 @@
 from flask import Flask, jsonify
 from datetime import datetime, timezone
-import sqlite3
-import os
+from db import get_conn
 
-DB = "flights.db"
 app = Flask(__name__)
 
-if not os.path.exists("/data/flights.db"):
-    conn = sqlite3.connect("/data/flights.db")
-    with open("schema.sql") as f:
-        conn.executescript(f.read())
-    conn.close()
-
 def query(sql):
-    conn = sqlite3.connect(DB)
+    conn = get_conn()
     cur = conn.cursor()
     cur.execute(sql)
     rows = cur.fetchall()
+    cur.close()
     conn.close()
     return rows
 
@@ -31,10 +24,10 @@ def last10():
 
     return jsonify([
         {
-            "ts": datetime.fromtimestamp(r[0], tz=timezone.utc).isoformat(),
-            "callsign": r[1],
-            "gs_kts": r[2],
-            "alt_ft": r[3],
+            "ts": datetime.fromtimestamp(r["ts"], tz=timezone.utc).isoformat(),
+            "callsign": r["callsign"],
+            "gs_kts": r["gs_kts"],
+            "alt_ft": r["alt_ft"],
         }
         for r in rows
     ])
@@ -42,13 +35,17 @@ def last10():
 @app.get("/api/daily_counts")
 def daily():
     rows = query("""
-        SELECT strftime('%Y-%m-%d', ts, 'unixepoch'),
-               COUNT(DISTINCT icao || '-' || strftime('%H', ts, 'unixepoch'))
+        SELECT to_char(to_timestamp(ts), 'YYYY-MM-DD') AS day,
+               COUNT(*) AS flights
         FROM positions
         GROUP BY 1
         ORDER BY 1;
     """)
-    return jsonify([{"day": r[0], "flights": r[1]} for r in rows])
+    return jsonify(rows)
+
+@app.get("/")
+def home():
+    return "Arnhem Flight API is running"
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
