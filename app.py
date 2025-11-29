@@ -130,22 +130,40 @@ def start_collector_once():
 
 
 # -------------------------------------------------------------------
-# API Endpoints
+# Helper: definition "unique flight"
+# callsign + hour bucket (UTC) → 1 vlucht, neem laatste meting
 # -------------------------------------------------------------------
+# We implement this logic in SQL via DISTINCT + date_trunc('hour', to_timestamp(ts))
 
-# UNIQUE-LAST 10 (option B)
+
+# -------------------------------------------------------------------
+# /api/last10  – laatste 10 unieke vluchten
+# -------------------------------------------------------------------
 @app.get("/api/last10")
 def last10():
     rows = query("""
-        WITH unique_latest AS (
-            SELECT DISTINCT ON (callsign)
-                callsign, ts, gs_kts, alt_ft
-            FROM positions
-            WHERE callsign IS NOT NULL AND callsign <> ''
-            ORDER BY callsign, ts DESC
+        WITH base AS (
+          SELECT
+            callsign,
+            ts,
+            gs_kts,
+            alt_ft,
+            date_trunc('hour', to_timestamp(ts)) AS hour_bucket
+          FROM positions
+          WHERE callsign IS NOT NULL AND callsign <> ''
+        ),
+        uniq AS (
+          SELECT DISTINCT ON (callsign, hour_bucket)
+            callsign,
+            ts,
+            gs_kts,
+            alt_ft,
+            hour_bucket
+          FROM base
+          ORDER BY callsign, hour_bucket, ts DESC
         )
         SELECT *
-        FROM unique_latest
+        FROM uniq
         ORDER BY ts DESC
         LIMIT 10;
     """)
@@ -155,68 +173,99 @@ def last10():
             "ts": datetime.fromtimestamp(r["ts"], tz=timezone.utc).isoformat(),
             "callsign": r["callsign"],
             "gs_kts": r["gs_kts"],
-            "alt_ft": r["alt_ft"]
+            "alt_ft": r["alt_ft"],
         }
         for r in rows
     ])
 
 
+# -------------------------------------------------------------------
+# /api/daily_counts – aantal unieke vluchten per dag
+# -------------------------------------------------------------------
 @app.get("/api/daily_counts")
 def daily_counts():
     rows = query("""
-        SELECT to_char(to_timestamp(ts), 'YYYY-MM-DD') AS day,
-               COUNT(*) AS flights
-        FROM positions
-        GROUP BY 1
-        ORDER BY 1;
+        SELECT day, COUNT(*) AS flights
+        FROM (
+          SELECT DISTINCT
+            callsign,
+            date_trunc('hour', to_timestamp(ts)) AS hour_bucket,
+            to_char(to_timestamp(ts), 'YYYY-MM-DD') AS day
+          FROM positions
+          WHERE callsign IS NOT NULL AND callsign <> ''
+        ) t
+        GROUP BY day
+        ORDER BY day;
     """)
     return jsonify(rows)
 
 
+# -------------------------------------------------------------------
+# /api/stats – gebaseerd op unieke vluchten
+# -------------------------------------------------------------------
 @app.get("/api/stats")
 def stats():
     conn = get_conn()
     cur = conn.cursor()
 
-    # global stats
+    # First/last measurement timestamps (ruwe data)
     cur.execute("""
-        SELECT COUNT(*) AS total, MIN(ts) AS first_ts, MAX(ts) AS last_ts
+        SELECT MIN(ts) AS first_ts, MAX(ts) AS last_ts
         FROM positions;
     """)
-    s = cur.fetchone()
+    row0 = cur.fetchone()
+    first_ts = row0["first_ts"]
+    last_ts = row0["last_ts"]
 
-    total = s["total"]
-    first_ts = s["first_ts"]
-    last_ts = s["last_ts"]
-
-    # per-day stats
+    # Total unique flights (callsign + hour bucket)
     cur.execute("""
-        SELECT to_char(to_timestamp(ts), 'YYYY-MM-DD') AS day,
-               COUNT(*) AS flights
-        FROM positions
-        GROUP BY 1
-        ORDER BY 1;
+        SELECT COUNT(*) AS total
+        FROM (
+          SELECT DISTINCT
+            callsign,
+            date_trunc('hour', to_timestamp(ts)) AS hour_bucket
+          FROM positions
+          WHERE callsign IS NOT NULL AND callsign <> ''
+        ) t;
     """)
-    days_raw = cur.fetchall()
+    row1 = cur.fetchone()
+    total = row1["total"]
 
-    # compute median & max
-    days = len(days_raw)
-    if days > 0:
-        counts = sorted([d["flights"] for d in days_raw])
-        mid = days // 2
-        if days % 2 == 1:
-            median = counts[mid]
-        else:
-            median = (counts[mid - 1] + counts[mid]) / 2
-        max_flights = max(counts)
-        max_day = days_raw[counts.index(max_flights)]["day"]
-    else:
-        median = 0
-        max_flights = 0
-        max_day = None
+    # Per-day stats (unique flights per day)
+    cur.execute("""
+        SELECT day, COUNT(*) AS flights
+        FROM (
+          SELECT DISTINCT
+            callsign,
+            date_trunc('hour', to_timestamp(ts)) AS hour_bucket,
+            to_char(to_timestamp(ts), 'YYYY-MM-DD') AS day
+          FROM positions
+          WHERE callsign IS NOT NULL AND callsign <> ''
+        ) t
+        GROUP BY day
+        ORDER BY day;
+    """)
+    daily_rows = cur.fetchall()
 
     cur.close()
     conn.close()
+
+    days = len(daily_rows)
+    median = 0
+    max_flights = 0
+    max_day = None
+
+    if days > 0:
+        counts = [d["flights"] for d in daily_rows]
+        sorted_counts = sorted(counts)
+        mid = days // 2
+        if days % 2 == 1:
+            median = sorted_counts[mid]
+        else:
+            median = (sorted_counts[mid - 1] + sorted_counts[mid]) / 2
+
+        max_flights = max(counts)
+        max_day = daily_rows[counts.index(max_flights)]["day"]
 
     def iso(ts):
         if ts is None:
@@ -234,26 +283,42 @@ def stats():
     })
 
 
+# -------------------------------------------------------------------
+# /api/hourly_heatmap – unieke vluchten per weekday × uur
+# -------------------------------------------------------------------
 @app.get("/api/hourly_heatmap")
 def hourly_heatmap():
     rows = query("""
-        SELECT
-          EXTRACT(DOW FROM to_timestamp(ts))::INT AS dow,
-          EXTRACT(HOUR FROM to_timestamp(ts))::INT AS hour,
-          COUNT(*) AS flights
-        FROM positions
-        GROUP BY 1,2
-        ORDER BY 1,2;
+        SELECT dow, hour, COUNT(*) AS flights
+        FROM (
+          SELECT DISTINCT
+            callsign,
+            date_trunc('hour', to_timestamp(ts)) AS hour_bucket,
+            EXTRACT(DOW FROM to_timestamp(ts))::INT AS dow,
+            EXTRACT(HOUR FROM to_timestamp(ts))::INT AS hour
+          FROM positions
+          WHERE callsign IS NOT NULL AND callsign <> ''
+        ) t
+        GROUP BY dow, hour
+        ORDER BY dow, hour;
     """)
     return jsonify(rows)
 
 
+# -------------------------------------------------------------------
+# /api/top_callsigns – op basis van unieke uren per callsign
+# -------------------------------------------------------------------
 @app.get("/api/top_callsigns")
 def top_callsigns():
     rows = query("""
         SELECT callsign, COUNT(*) AS flights
-        FROM positions
-        WHERE callsign IS NOT NULL AND callsign <> ''
+        FROM (
+          SELECT DISTINCT
+            callsign,
+            date_trunc('hour', to_timestamp(ts)) AS hour_bucket
+          FROM positions
+          WHERE callsign IS NOT NULL AND callsign <> ''
+        ) t
         GROUP BY callsign
         ORDER BY flights DESC
         LIMIT 10;
@@ -261,6 +326,9 @@ def top_callsigns():
     return jsonify(rows)
 
 
+# -------------------------------------------------------------------
+# /api/tracks – ruwe tracks voor laatste 10 callsigns
+# -------------------------------------------------------------------
 @app.get("/api/tracks")
 def tracks():
     conn = get_conn()
@@ -285,12 +353,10 @@ def tracks():
     cur.close()
     conn.close()
 
-    tracks = {}
+    grouped = {}
     for r in rows:
         cs = r["callsign"]
-        if cs not in tracks:
-            tracks[cs] = []
-        tracks[cs].append({
+        grouped.setdefault(cs, []).append({
             "ts": datetime.fromtimestamp(r["ts"], tz=timezone.utc).isoformat(),
             "lat": r["lat"],
             "lon": r["lon"],
@@ -299,7 +365,7 @@ def tracks():
 
     return jsonify([
         {"callsign": cs, "points": pts}
-        for cs, pts in tracks.items()
+        for cs, pts in grouped.items()
     ])
 
 
@@ -309,7 +375,7 @@ def home():
 
 
 # -------------------------------------------------------------------
-# Run only when local (Render uses gunicorn)
+# Local run (Render uses gunicorn app:app)
 # -------------------------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
