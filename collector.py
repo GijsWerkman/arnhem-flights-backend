@@ -2,6 +2,7 @@ import time
 import math
 import requests
 import sqlite3
+import os
 from datetime import datetime, timezone
 
 ARNHEM_LAT = 51.9851
@@ -9,6 +10,13 @@ ARNHEM_LON = 5.8987
 BUBBLE_RADIUS_KM = 5.0
 ADSB_URL = "https://opendata.adsb.fi/api/v3/lat/51.9851/lon/5.8987/dist/3"
 DB_PATH = "/data/flights.db"
+
+if not os.path.exists("/data/flights.db"):
+    import sqlite3
+    conn = sqlite3.connect("/data/flights.db")
+    with open("schema.sql") as f:
+        conn.executescript(f.read())
+    conn.close()
 
 def haversine_km(lat1, lon1, lat2, lon2):
     R = 6371.0
