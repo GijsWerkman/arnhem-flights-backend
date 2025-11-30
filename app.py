@@ -74,7 +74,7 @@ def save_positions(ac_list):
         if lat is None or lon is None:
             continue
 
-        # restrict to 5 km bubble
+        # restrict to 7.5 km bubble
         if haversine_km(ARNHEM_LAT, ARNHEM_LON, lat, lon) > BUBBLE_RADIUS_KM:
             continue
 
@@ -130,40 +130,67 @@ def start_collector_once():
 
 
 # -------------------------------------------------------------------
-# Helper: definition "unique flight"
-# callsign + hour bucket (UTC) → 1 vlucht, neem laatste meting
+# Helper: definitie "unieke vlucht" (rollend 60-minutenvenster)
+#
+# Per callsign:
+# - Sorteer metingen op tijd (oud -> nieuw)
+# - Als ts - prev_ts > 3600 seconden OF er is geen prev_ts -> start nieuwe vlucht
+# - flight_seq = cumulatieve som van deze "is_new_flight"-flags
+#
+# Unieke vlucht = (callsign, flight_seq)
 # -------------------------------------------------------------------
-# We implement this logic in SQL via DISTINCT + date_trunc('hour', to_timestamp(ts))
 
 
 # -------------------------------------------------------------------
-# /api/last10  – laatste 10 unieke vluchten
+# /api/last10  – laatste 10 unieke vluchten (per callsign)
 # -------------------------------------------------------------------
 @app.get("/api/last10")
 def last10():
     rows = query("""
-        WITH base AS (
+        WITH ordered AS (
           SELECT
             callsign,
             ts,
             gs_kts,
             alt_ft,
-            date_trunc('hour', to_timestamp(ts)) AS hour_bucket
+            LAG(ts) OVER (PARTITION BY callsign ORDER BY ts) AS prev_ts
           FROM positions
           WHERE callsign IS NOT NULL AND callsign <> ''
         ),
-        uniq AS (
-          SELECT DISTINCT ON (callsign, hour_bucket)
+        flagged AS (
+          SELECT
             callsign,
             ts,
             gs_kts,
             alt_ft,
-            hour_bucket
-          FROM base
-          ORDER BY callsign, hour_bucket, ts DESC
+            CASE
+              WHEN prev_ts IS NULL THEN 1
+              WHEN ts - prev_ts > 3600 THEN 1
+              ELSE 0
+            END AS is_new_flight
+          FROM ordered
+        ),
+        segmented AS (
+          SELECT
+            callsign,
+            ts,
+            gs_kts,
+            alt_ft,
+            SUM(is_new_flight) OVER (PARTITION BY callsign ORDER BY ts) AS flight_seq
+          FROM flagged
+        ),
+        flights AS (
+          -- neem per vlucht (callsign, flight_seq) de laatste meting
+          SELECT DISTINCT ON (callsign, flight_seq)
+            callsign,
+            ts,
+            gs_kts,
+            alt_ft
+          FROM segmented
+          ORDER BY callsign, flight_seq, ts DESC
         )
-        SELECT *
-        FROM uniq
+        SELECT callsign, ts, gs_kts, alt_ft
+        FROM flights
         ORDER BY ts DESC
         LIMIT 10;
     """)
@@ -185,15 +212,49 @@ def last10():
 @app.get("/api/daily_counts")
 def daily_counts():
     rows = query("""
-        SELECT day, COUNT(*) AS flights
-        FROM (
-          SELECT DISTINCT
+        WITH ordered AS (
+          SELECT
             callsign,
-            date_trunc('hour', to_timestamp(ts)) AS hour_bucket,
-            to_char(to_timestamp(ts), 'YYYY-MM-DD') AS day
+            ts,
+            gs_kts,
+            alt_ft,
+            LAG(ts) OVER (PARTITION BY callsign ORDER BY ts) AS prev_ts
           FROM positions
           WHERE callsign IS NOT NULL AND callsign <> ''
-        ) t
+        ),
+        flagged AS (
+          SELECT
+            callsign,
+            ts,
+            gs_kts,
+            alt_ft,
+            CASE
+              WHEN prev_ts IS NULL THEN 1
+              WHEN ts - prev_ts > 3600 THEN 1
+              ELSE 0
+            END AS is_new_flight
+          FROM ordered
+        ),
+        segmented AS (
+          SELECT
+            callsign,
+            ts,
+            gs_kts,
+            alt_ft,
+            SUM(is_new_flight) OVER (PARTITION BY callsign ORDER BY ts) AS flight_seq
+          FROM flagged
+        ),
+        flights AS (
+          SELECT DISTINCT ON (callsign, flight_seq)
+            callsign,
+            ts
+          FROM segmented
+          ORDER BY callsign, flight_seq, ts DESC
+        )
+        SELECT
+          to_char(to_timestamp(ts), 'YYYY-MM-DD') AS day,
+          COUNT(*) AS flights
+        FROM flights
         GROUP BY day
         ORDER BY day;
     """)
@@ -208,7 +269,7 @@ def stats():
     conn = get_conn()
     cur = conn.cursor()
 
-    # First/last measurement timestamps (ruwe data)
+    # Eerste en laatste ruwe meting (meetperiode)
     cur.execute("""
         SELECT MIN(ts) AS first_ts, MAX(ts) AS last_ts
         FROM positions;
@@ -217,46 +278,78 @@ def stats():
     first_ts = row0["first_ts"]
     last_ts = row0["last_ts"]
 
-    # Total unique flights (callsign + hour bucket)
+    # Unieke vluchten (callsign, flight_seq) op basis van rollend 60-minutenvenster
     cur.execute("""
-        SELECT COUNT(*) AS total
-        FROM (
-          SELECT DISTINCT
+        WITH ordered AS (
+          SELECT
             callsign,
-            date_trunc('hour', to_timestamp(ts)) AS hour_bucket
+            ts,
+            gs_kts,
+            alt_ft,
+            LAG(ts) OVER (PARTITION BY callsign ORDER BY ts) AS prev_ts
           FROM positions
           WHERE callsign IS NOT NULL AND callsign <> ''
-        ) t;
+        ),
+        flagged AS (
+          SELECT
+            callsign,
+            ts,
+            gs_kts,
+            alt_ft,
+            CASE
+              WHEN prev_ts IS NULL THEN 1
+              WHEN ts - prev_ts > 3600 THEN 1
+              ELSE 0
+            END AS is_new_flight
+          FROM ordered
+        ),
+        segmented AS (
+          SELECT
+            callsign,
+            ts,
+            gs_kts,
+            alt_ft,
+            SUM(is_new_flight) OVER (PARTITION BY callsign ORDER BY ts) AS flight_seq
+          FROM flagged
+        ),
+        flights AS (
+          SELECT DISTINCT ON (callsign, flight_seq)
+            callsign,
+            ts
+          FROM segmented
+          ORDER BY callsign, flight_seq, ts DESC
+        )
+        SELECT
+          COUNT(*) AS total,
+          ARRAY_AGG(
+            JSON_BUILD_OBJECT(
+              'day', to_char(to_timestamp(ts), 'YYYY-MM-DD'),
+              'ts', ts
+            )
+            ORDER BY ts
+          ) AS daily_detail
+        FROM flights;
     """)
     row1 = cur.fetchone()
     total = row1["total"]
-
-    # Per-day stats (unique flights per day)
-    cur.execute("""
-        SELECT day, COUNT(*) AS flights
-        FROM (
-          SELECT DISTINCT
-            callsign,
-            date_trunc('hour', to_timestamp(ts)) AS hour_bucket,
-            to_char(to_timestamp(ts), 'YYYY-MM-DD') AS day
-          FROM positions
-          WHERE callsign IS NOT NULL AND callsign <> ''
-        ) t
-        GROUP BY day
-        ORDER BY day;
-    """)
-    daily_rows = cur.fetchall()
+    daily_detail = row1["daily_detail"] or []
 
     cur.close()
     conn.close()
 
-    days = len(daily_rows)
+    # daily_detail is een array van {day, ts}; we reduceren dit naar counts per dag
+    day_counts = {}
+    for item in daily_detail:
+        day = item["day"]
+        day_counts[day] = day_counts.get(day, 0) + 1
+
+    days = len(day_counts)
     median = 0
     max_flights = 0
     max_day = None
 
     if days > 0:
-        counts = [d["flights"] for d in daily_rows]
+        counts = list(day_counts.values())
         sorted_counts = sorted(counts)
         mid = days // 2
         if days % 2 == 1:
@@ -265,7 +358,11 @@ def stats():
             median = (sorted_counts[mid - 1] + sorted_counts[mid]) / 2
 
         max_flights = max(counts)
-        max_day = daily_rows[counts.index(max_flights)]["day"]
+        # pak een dag met deze max
+        for d, c in day_counts.items():
+            if c == max_flights:
+                max_day = d
+                break
 
     def iso(ts):
         if ts is None:
@@ -285,20 +382,55 @@ def stats():
 
 # -------------------------------------------------------------------
 # /api/hourly_heatmap – unieke vluchten per weekday × uur
+#   (gebaseerd op het tijdstip van de laatste meting per vlucht)
 # -------------------------------------------------------------------
 @app.get("/api/hourly_heatmap")
 def hourly_heatmap():
     rows = query("""
-        SELECT dow, hour, COUNT(*) AS flights
-        FROM (
-          SELECT DISTINCT
+        WITH ordered AS (
+          SELECT
             callsign,
-            date_trunc('hour', to_timestamp(ts)) AS hour_bucket,
-            EXTRACT(DOW FROM to_timestamp(ts))::INT AS dow,
-            EXTRACT(HOUR FROM to_timestamp(ts))::INT AS hour
+            ts,
+            gs_kts,
+            alt_ft,
+            LAG(ts) OVER (PARTITION BY callsign ORDER BY ts) AS prev_ts
           FROM positions
           WHERE callsign IS NOT NULL AND callsign <> ''
-        ) t
+        ),
+        flagged AS (
+          SELECT
+            callsign,
+            ts,
+            gs_kts,
+            alt_ft,
+            CASE
+              WHEN prev_ts IS NULL THEN 1
+              WHEN ts - prev_ts > 3600 THEN 1
+              ELSE 0
+            END AS is_new_flight
+          FROM ordered
+        ),
+        segmented AS (
+          SELECT
+            callsign,
+            ts,
+            gs_kts,
+            alt_ft,
+            SUM(is_new_flight) OVER (PARTITION BY callsign ORDER BY ts) AS flight_seq
+          FROM flagged
+        ),
+        flights AS (
+          SELECT DISTINCT ON (callsign, flight_seq)
+            callsign,
+            ts
+          FROM segmented
+          ORDER BY callsign, flight_seq, ts DESC
+        )
+        SELECT
+          EXTRACT(DOW FROM to_timestamp(ts))::INT AS dow,
+          EXTRACT(HOUR FROM to_timestamp(ts))::INT AS hour,
+          COUNT(*) AS flights
+        FROM flights
         GROUP BY dow, hour
         ORDER BY dow, hour;
     """)
@@ -306,19 +438,54 @@ def hourly_heatmap():
 
 
 # -------------------------------------------------------------------
-# /api/top_callsigns – op basis van unieke uren per callsign
+# /api/top_callsigns – aantal unieke vluchten per callsign
 # -------------------------------------------------------------------
 @app.get("/api/top_callsigns")
 def top_callsigns():
     rows = query("""
-        SELECT callsign, COUNT(*) AS flights
-        FROM (
-          SELECT DISTINCT
+        WITH ordered AS (
+          SELECT
             callsign,
-            date_trunc('hour', to_timestamp(ts)) AS hour_bucket
+            ts,
+            gs_kts,
+            alt_ft,
+            LAG(ts) OVER (PARTITION BY callsign ORDER BY ts) AS prev_ts
           FROM positions
           WHERE callsign IS NOT NULL AND callsign <> ''
-        ) t
+        ),
+        flagged AS (
+          SELECT
+            callsign,
+            ts,
+            gs_kts,
+            alt_ft,
+            CASE
+              WHEN prev_ts IS NULL THEN 1
+              WHEN ts - prev_ts > 3600 THEN 1
+              ELSE 0
+            END AS is_new_flight
+          FROM ordered
+        ),
+        segmented AS (
+          SELECT
+            callsign,
+            ts,
+            gs_kts,
+            alt_ft,
+            SUM(is_new_flight) OVER (PARTITION BY callsign ORDER BY ts) AS flight_seq
+          FROM flagged
+        ),
+        flights AS (
+          SELECT DISTINCT ON (callsign, flight_seq)
+            callsign,
+            ts
+          FROM segmented
+          ORDER BY callsign, flight_seq, ts DESC
+        )
+        SELECT
+          callsign,
+          COUNT(*) AS flights
+        FROM flights
         GROUP BY callsign
         ORDER BY flights DESC
         LIMIT 10;
@@ -327,7 +494,7 @@ def top_callsigns():
 
 
 # -------------------------------------------------------------------
-# /api/tracks – ruwe tracks voor laatste 10 callsigns
+# /api/tracks – routes van de laatste vlucht per callsign
 # -------------------------------------------------------------------
 @app.get("/api/tracks")
 def tracks():
@@ -335,18 +502,60 @@ def tracks():
     cur = conn.cursor()
 
     cur.execute("""
-        WITH latest AS (
-          SELECT callsign, MAX(ts) AS last_ts
+        WITH ordered AS (
+          SELECT
+            callsign,
+            ts,
+            lat,
+            lon,
+            alt_ft,
+            LAG(ts) OVER (PARTITION BY callsign ORDER BY ts) AS prev_ts
           FROM positions
           WHERE callsign IS NOT NULL AND callsign <> ''
-          GROUP BY callsign
-          ORDER BY last_ts DESC
-          LIMIT 10
+        ),
+        flagged AS (
+          SELECT
+            callsign,
+            ts,
+            lat,
+            lon,
+            alt_ft,
+            CASE
+              WHEN prev_ts IS NULL THEN 1
+              WHEN ts - prev_ts > 3600 THEN 1
+              ELSE 0
+            END AS is_new_flight
+          FROM ordered
+        ),
+        segmented AS (
+          SELECT
+            callsign,
+            ts,
+            lat,
+            lon,
+            alt_ft,
+            SUM(is_new_flight) OVER (PARTITION BY callsign ORDER BY ts) AS flight_seq
+          FROM flagged
+        ),
+        last_flights AS (
+          -- per callsign: de meest recente vlucht (hoogste ts)
+          SELECT DISTINCT ON (callsign)
+            callsign,
+            flight_seq
+          FROM segmented
+          ORDER BY callsign, ts DESC
         )
-        SELECT p.callsign, p.ts, p.lat, p.lon, p.alt_ft
-        FROM positions p
-        JOIN latest l USING (callsign)
-        ORDER BY l.last_ts DESC, p.ts ASC;
+        SELECT
+          s.callsign,
+          s.ts,
+          s.lat,
+          s.lon,
+          s.alt_ft
+        FROM segmented s
+        JOIN last_flights lf
+          ON s.callsign = lf.callsign
+         AND s.flight_seq = lf.flight_seq
+        ORDER BY s.callsign, s.ts ASC;
     """)
 
     rows = cur.fetchall()
