@@ -8,10 +8,16 @@ import requests
 
 from db import get_conn
 
-# Arnhem bubble config
+# Arnhem config
 ARNHEM_LAT = 51.9851
 ARNHEM_LON = 5.8987
+
+# Statistieken-bubbel (km)
 BUBBLE_RADIUS_KM = 7.5
+
+# Opslag-bereik voor tracks (km) – optie C
+TRACK_RADIUS_KM = 20.0
+
 ADSB_URL = "https://opendata.adsb.fi/api/v3/lat/51.9851/lon/5.8987/dist/3"
 
 app = Flask(__name__)
@@ -64,6 +70,10 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 
 def save_positions(ac_list):
+    """
+    Sla ALLE metingen op binnen TRACK_RADIUS_KM (20 km),
+    zodat routes op de kaart volledig zichtbaar zijn.
+    """
     conn = get_conn()
     cur = conn.cursor()
     now = int(datetime.now(timezone.utc).timestamp())
@@ -74,8 +84,8 @@ def save_positions(ac_list):
         if lat is None or lon is None:
             continue
 
-        # restrict to 7.5 km bubble
-        if haversine_km(ARNHEM_LAT, ARNHEM_LON, lat, lon) > BUBBLE_RADIUS_KM:
+        # restrict to 20 km opslag-bereik
+        if haversine_km(ARNHEM_LAT, ARNHEM_LON, lat, lon) > TRACK_RADIUS_KM:
             continue
 
         cur.execute(
@@ -130,6 +140,22 @@ def start_collector_once():
 
 
 # -------------------------------------------------------------------
+# Helper: SQL-fragment voor bubbel-filter (7.5 km, Haversine in PostgreSQL)
+#
+# LET OP: dit wordt als string letterlijk in de queries geplakt.
+# -------------------------------------------------------------------
+BUBBLE_SQL = f"""
+  (6371 * 2 * ASIN(
+     SQRT(
+       POWER(SIN(RADIANS(lat - {ARNHEM_LAT})/2), 2) +
+       COS(RADIANS({ARNHEM_LAT})) * COS(RADIANS(lat)) *
+       POWER(SIN(RADIANS(lon - {ARNHEM_LON})/2), 2)
+     )
+   )) <= {BUBBLE_RADIUS_KM}
+"""
+
+
+# -------------------------------------------------------------------
 # Helper: definitie "unieke vlucht" (rollend 60-minutenvenster)
 #
 # Per callsign:
@@ -138,15 +164,17 @@ def start_collector_once():
 # - flight_seq = cumulatieve som van deze "is_new_flight"-flags
 #
 # Unieke vlucht = (callsign, flight_seq)
+#
+# Voor ALLE statistieken gebruiken we alleen metingen BINNEN de 7.5 km bubbel.
 # -------------------------------------------------------------------
 
 
 # -------------------------------------------------------------------
-# /api/last10  – laatste 10 unieke vluchten (per callsign)
+# /api/last10  – laatste 10 unieke vluchten (op basis van bubbel-metingen)
 # -------------------------------------------------------------------
 @app.get("/api/last10")
 def last10():
-    rows = query("""
+    rows = query(f"""
         WITH ordered AS (
           SELECT
             callsign,
@@ -155,7 +183,9 @@ def last10():
             alt_ft,
             LAG(ts) OVER (PARTITION BY callsign ORDER BY ts) AS prev_ts
           FROM positions
-          WHERE callsign IS NOT NULL AND callsign <> ''
+          WHERE callsign IS NOT NULL
+            AND callsign <> ''
+            AND {BUBBLE_SQL}
         ),
         flagged AS (
           SELECT
@@ -180,7 +210,7 @@ def last10():
           FROM flagged
         ),
         flights AS (
-          -- neem per vlucht (callsign, flight_seq) de laatste meting
+          -- per vlucht (callsign, flight_seq) de laatste meting in de bubbel
           SELECT DISTINCT ON (callsign, flight_seq)
             callsign,
             ts,
@@ -207,11 +237,11 @@ def last10():
 
 
 # -------------------------------------------------------------------
-# /api/daily_counts – aantal unieke vluchten per dag
+# /api/daily_counts – aantal unieke vluchten per dag (bubbel)
 # -------------------------------------------------------------------
 @app.get("/api/daily_counts")
 def daily_counts():
-    rows = query("""
+    rows = query(f"""
         WITH ordered AS (
           SELECT
             callsign,
@@ -220,7 +250,9 @@ def daily_counts():
             alt_ft,
             LAG(ts) OVER (PARTITION BY callsign ORDER BY ts) AS prev_ts
           FROM positions
-          WHERE callsign IS NOT NULL AND callsign <> ''
+          WHERE callsign IS NOT NULL
+            AND callsign <> ''
+            AND {BUBBLE_SQL}
         ),
         flagged AS (
           SELECT
@@ -262,14 +294,14 @@ def daily_counts():
 
 
 # -------------------------------------------------------------------
-# /api/stats – gebaseerd op unieke vluchten
+# /api/stats – gebaseerd op unieke vluchten in de bubbel
 # -------------------------------------------------------------------
 @app.get("/api/stats")
 def stats():
     conn = get_conn()
     cur = conn.cursor()
 
-    # Eerste en laatste ruwe meting (meetperiode)
+    # Eerste en laatste ruwe meting (meetperiode, alle data binnen 20 km)
     cur.execute("""
         SELECT MIN(ts) AS first_ts, MAX(ts) AS last_ts
         FROM positions;
@@ -278,8 +310,8 @@ def stats():
     first_ts = row0["first_ts"]
     last_ts = row0["last_ts"]
 
-    # Unieke vluchten (callsign, flight_seq) op basis van rollend 60-minutenvenster
-    cur.execute("""
+    # Unieke vluchten in de bubbel
+    cur.execute(f"""
         WITH ordered AS (
           SELECT
             callsign,
@@ -288,7 +320,9 @@ def stats():
             alt_ft,
             LAG(ts) OVER (PARTITION BY callsign ORDER BY ts) AS prev_ts
           FROM positions
-          WHERE callsign IS NOT NULL AND callsign <> ''
+          WHERE callsign IS NOT NULL
+            AND callsign <> ''
+            AND {BUBBLE_SQL}
         ),
         flagged AS (
           SELECT
@@ -337,7 +371,7 @@ def stats():
     cur.close()
     conn.close()
 
-    # daily_detail is een array van {day, ts}; we reduceren dit naar counts per dag
+    # daily_detail is een array van {day, ts}; reduceer naar counts per dag
     day_counts = {}
     for item in daily_detail:
         day = item["day"]
@@ -358,7 +392,6 @@ def stats():
             median = (sorted_counts[mid - 1] + sorted_counts[mid]) / 2
 
         max_flights = max(counts)
-        # pak een dag met deze max
         for d, c in day_counts.items():
             if c == max_flights:
                 max_day = d
@@ -381,12 +414,11 @@ def stats():
 
 
 # -------------------------------------------------------------------
-# /api/hourly_heatmap – unieke vluchten per weekday × uur
-#   (gebaseerd op het tijdstip van de laatste meting per vlucht)
+# /api/hourly_heatmap – unieke vluchten per weekday × uur (bubbel)
 # -------------------------------------------------------------------
 @app.get("/api/hourly_heatmap")
 def hourly_heatmap():
-    rows = query("""
+    rows = query(f"""
         WITH ordered AS (
           SELECT
             callsign,
@@ -395,7 +427,9 @@ def hourly_heatmap():
             alt_ft,
             LAG(ts) OVER (PARTITION BY callsign ORDER BY ts) AS prev_ts
           FROM positions
-          WHERE callsign IS NOT NULL AND callsign <> ''
+          WHERE callsign IS NOT NULL
+            AND callsign <> ''
+            AND {BUBBLE_SQL}
         ),
         flagged AS (
           SELECT
@@ -438,11 +472,11 @@ def hourly_heatmap():
 
 
 # -------------------------------------------------------------------
-# /api/top_callsigns – aantal unieke vluchten per callsign
+# /api/top_callsigns – aantal unieke vluchten per callsign (bubbel)
 # -------------------------------------------------------------------
 @app.get("/api/top_callsigns")
 def top_callsigns():
-    rows = query("""
+    rows = query(f"""
         WITH ordered AS (
           SELECT
             callsign,
@@ -451,7 +485,9 @@ def top_callsigns():
             alt_ft,
             LAG(ts) OVER (PARTITION BY callsign ORDER BY ts) AS prev_ts
           FROM positions
-          WHERE callsign IS NOT NULL AND callsign <> ''
+          WHERE callsign IS NOT NULL
+            AND callsign <> ''
+            AND {BUBBLE_SQL}
         ),
         flagged AS (
           SELECT
@@ -494,7 +530,10 @@ def top_callsigns():
 
 
 # -------------------------------------------------------------------
-# /api/tracks – routes van de laatste vlucht per callsign
+# /api/tracks – routes van de 10 meest recente vluchten (volledige track)
+#
+# Hier gebruiken we ALLE opgeslagen data (20 km),
+# zodat de lijnen op de kaart niet worden afgekapt bij 7.5 km.
 # -------------------------------------------------------------------
 @app.get("/api/tracks")
 def tracks():
@@ -511,7 +550,8 @@ def tracks():
             alt_ft,
             LAG(ts) OVER (PARTITION BY callsign ORDER BY ts) AS prev_ts
           FROM positions
-          WHERE callsign IS NOT NULL AND callsign <> ''
+          WHERE callsign IS NOT NULL
+            AND callsign <> ''
         ),
         flagged AS (
           SELECT
@@ -537,13 +577,20 @@ def tracks():
             SUM(is_new_flight) OVER (PARTITION BY callsign ORDER BY ts) AS flight_seq
           FROM flagged
         ),
-        last_flights AS (
-          -- per callsign: de meest recente vlucht (hoogste ts)
-          SELECT DISTINCT ON (callsign)
+        flights AS (
+          -- per vlucht: laatste tijdstip
+          SELECT DISTINCT ON (callsign, flight_seq)
             callsign,
-            flight_seq
+            flight_seq,
+            ts AS last_ts
           FROM segmented
-          ORDER BY callsign, ts DESC
+          ORDER BY callsign, flight_seq, ts DESC
+        ),
+        latest10 AS (
+          SELECT *
+          FROM flights
+          ORDER BY last_ts DESC
+          LIMIT 10
         )
         SELECT
           s.callsign,
@@ -552,10 +599,10 @@ def tracks():
           s.lon,
           s.alt_ft
         FROM segmented s
-        JOIN last_flights lf
+        JOIN latest10 lf
           ON s.callsign = lf.callsign
          AND s.flight_seq = lf.flight_seq
-        ORDER BY s.callsign, s.ts ASC;
+        ORDER BY lf.last_ts DESC, s.ts ASC;
     """)
 
     rows = cur.fetchall()
