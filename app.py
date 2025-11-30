@@ -140,9 +140,7 @@ def start_collector_once():
 
 
 # -------------------------------------------------------------------
-# Helper: SQL-fragment voor bubbel-filter (7.5 km, Haversine in PostgreSQL)
-#
-# LET OP: dit wordt als string letterlijk in de queries geplakt.
+# SQL-fragment voor bubbel-filter (7.5 km, Haversine in PostgreSQL)
 # -------------------------------------------------------------------
 BUBBLE_SQL = f"""
   (6371 * 2 * ASIN(
@@ -156,17 +154,16 @@ BUBBLE_SQL = f"""
 
 
 # -------------------------------------------------------------------
-# Helper: definitie "unieke vlucht" (rollend 60-minutenvenster)
-#
-# Per callsign:
-# - Sorteer metingen op tijd (oud -> nieuw)
-# - Als ts - prev_ts > 3600 seconden OF er is geen prev_ts -> start nieuwe vlucht
-# - flight_seq = cumulatieve som van deze "is_new_flight"-flags
-#
-# Unieke vlucht = (callsign, flight_seq)
-#
-# Voor ALLE statistieken gebruiken we alleen metingen BINNEN de 7.5 km bubbel.
+# Helper: datumformat NL
 # -------------------------------------------------------------------
+def to_nl_date(ymd):
+    if not ymd:
+        return None
+    try:
+        dt = datetime.strptime(ymd, "%Y-%m-%d")
+        return dt.strftime("%d-%m-%Y")
+    except Exception:
+        return ymd  # fallback
 
 
 # -------------------------------------------------------------------
@@ -402,26 +399,15 @@ def stats():
             return None
         return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
-# Convert max_day YYYY-MM-DD -> DD-MM-YYYY
-def to_nl_date(ymd):
-    if not ymd:
-        return None
-    try:
-        dt = datetime.strptime(ymd, "%Y-%m-%d")
-        return dt.strftime("%d-%m-%Y")
-    except:
-        return ymd  # fallback
-
-return jsonify({
-    "total_flights": total,
-    "first_ts": iso(first_ts),
-    "last_ts": iso(last_ts),
-    "days": days,
-    "median_per_day": median,
-    "max_per_day": max_flights,
-    "max_per_day_date": to_nl_date(max_day)
-})
-
+    return jsonify({
+        "total_flights": total,
+        "first_ts": iso(first_ts),
+        "last_ts": iso(last_ts),
+        "days": days,
+        "median_per_day": median,
+        "max_per_day": max_flights,
+        "max_per_day_date": to_nl_date(max_day)
+    })
 
 
 # -------------------------------------------------------------------
@@ -541,10 +527,109 @@ def top_callsigns():
 
 
 # -------------------------------------------------------------------
+# /api/hist_speed – ruwe snelheden (kts) van unieke vluchten (bubbel)
+# -------------------------------------------------------------------
+@app.get("/api/hist_speed")
+def hist_speed():
+    rows = query(f"""
+        WITH ordered AS (
+          SELECT
+            callsign,
+            ts,
+            gs_kts,
+            LAG(ts) OVER (PARTITION BY callsign ORDER BY ts) AS prev_ts
+          FROM positions
+          WHERE callsign IS NOT NULL
+            AND callsign <> ''
+            AND {BUBBLE_SQL}
+        ),
+        flagged AS (
+          SELECT
+            callsign,
+            ts,
+            gs_kts,
+            CASE
+              WHEN prev_ts IS NULL THEN 1
+              WHEN ts - prev_ts > 3600 THEN 1
+              ELSE 0
+            END AS is_new_flight
+          FROM ordered
+        ),
+        segmented AS (
+          SELECT
+            callsign,
+            ts,
+            gs_kts,
+            SUM(is_new_flight) OVER (PARTITION BY callsign ORDER BY ts) AS flight_seq
+          FROM flagged
+        ),
+        flights AS (
+          SELECT DISTINCT ON (callsign, flight_seq)
+            gs_kts
+          FROM segmented
+          ORDER BY callsign, flight_seq, ts DESC
+        )
+        SELECT gs_kts
+        FROM flights
+        WHERE gs_kts IS NOT NULL;
+    """)
+
+    return jsonify([r["gs_kts"] for r in rows])
+
+
+# -------------------------------------------------------------------
+# /api/hist_altitude – ruwe hoogtes (ft) van unieke vluchten (bubbel)
+# -------------------------------------------------------------------
+@app.get("/api/hist_altitude")
+def hist_altitude():
+    rows = query(f"""
+        WITH ordered AS (
+          SELECT
+            callsign,
+            ts,
+            alt_ft,
+            LAG(ts) OVER (PARTITION BY callsign ORDER BY ts) AS prev_ts
+          FROM positions
+          WHERE callsign IS NOT NULL
+            AND callsign <> ''
+            AND {BUBBLE_SQL}
+        ),
+        flagged AS (
+          SELECT
+            callsign,
+            ts,
+            alt_ft,
+            CASE
+              WHEN prev_ts IS NULL THEN 1
+              WHEN ts - prev_ts > 3600 THEN 1
+              ELSE 0
+            END AS is_new_flight
+          FROM ordered
+        ),
+        segmented AS (
+          SELECT
+            callsign,
+            ts,
+            alt_ft,
+            SUM(is_new_flight) OVER (PARTITION BY callsign ORDER BY ts) AS flight_seq
+          FROM flagged
+        ),
+        flights AS (
+          SELECT DISTINCT ON (callsign, flight_seq)
+            alt_ft
+          FROM segmented
+          ORDER BY callsign, flight_seq, ts DESC
+        )
+        SELECT alt_ft
+        FROM flights
+        WHERE alt_ft IS NOT NULL;
+    """)
+
+    return jsonify([r["alt_ft"] for r in rows])
+
+
+# -------------------------------------------------------------------
 # /api/tracks – routes van de 10 meest recente vluchten (volledige track)
-#
-# Hier gebruiken we ALLE opgeslagen data (20 km),
-# zodat de lijnen op de kaart niet worden afgekapt bij 7.5 km.
 # -------------------------------------------------------------------
 @app.get("/api/tracks")
 def tracks():
