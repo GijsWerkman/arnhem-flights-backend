@@ -402,15 +402,26 @@ def stats():
             return None
         return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
-    return jsonify({
-        "total_flights": total,
-        "first_ts": iso(first_ts),
-        "last_ts": iso(last_ts),
-        "days": days,
-        "median_per_day": median,
-        "max_per_day": max_flights,
-        "max_per_day_date": max_day
-    })
+# Convert max_day YYYY-MM-DD -> DD-MM-YYYY
+def to_nl_date(ymd):
+    if not ymd:
+        return None
+    try:
+        dt = datetime.strptime(ymd, "%Y-%m-%d")
+        return dt.strftime("%d-%m-%Y")
+    except:
+        return ymd  # fallback
+
+return jsonify({
+    "total_flights": total,
+    "first_ts": iso(first_ts),
+    "last_ts": iso(last_ts),
+    "days": days,
+    "median_per_day": median,
+    "max_per_day": max_flights,
+    "max_per_day_date": to_nl_date(max_day)
+})
+
 
 
 # -------------------------------------------------------------------
