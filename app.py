@@ -627,6 +627,70 @@ def hist_altitude():
 
     return jsonify([r["alt_ft"] for r in rows])
 
+# -------------------------------------------------------------------
+# /api/scatter – speed vs altitude of unique flights (bubble)
+# -------------------------------------------------------------------
+@app.get("/api/scatter")
+def scatter():
+    rows = query(f"""
+        WITH ordered AS (
+          SELECT
+            callsign,
+            ts,
+            gs_kts,
+            alt_ft,
+            LAG(ts) OVER (PARTITION BY callsign ORDER BY ts) AS prev_ts
+          FROM positions
+          WHERE callsign IS NOT NULL
+            AND callsign <> ''
+            AND {BUBBLE_SQL}       -- only measurements inside 7.5 km bubble
+        ),
+        flagged AS (
+          SELECT
+            callsign,
+            ts,
+            gs_kts,
+            alt_ft,
+            CASE
+              WHEN prev_ts IS NULL THEN 1
+              WHEN ts - prev_ts > 3600 THEN 1
+              ELSE 0
+            END AS is_new_flight
+          FROM ordered
+        ),
+        segmented AS (
+          SELECT
+            callsign,
+            ts,
+            gs_kts,
+            alt_ft,
+            SUM(is_new_flight) OVER (PARTITION BY callsign ORDER BY ts)
+              AS flight_seq
+          FROM flagged
+        ),
+        flights AS (
+          -- take last measurement inside bubble per unique flight
+          SELECT DISTINCT ON (callsign, flight_seq)
+            gs_kts,
+            alt_ft,
+            ts
+          FROM segmented
+          ORDER BY callsign, flight_seq, ts DESC
+        )
+        SELECT gs_kts, alt_ft
+        FROM flights
+        WHERE gs_kts IS NOT NULL
+          AND alt_ft IS NOT NULL;
+    """)
+
+    return jsonify([
+        {
+            "gs_kts": r["gs_kts"],
+            "alt_ft": r["alt_ft"]
+        }
+        for r in rows
+    ])
+
 
 # -------------------------------------------------------------------
 # /api/tracks – routes van de 10 meest recente vluchten (volledige track)
